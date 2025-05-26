@@ -10,7 +10,16 @@ import os
 
 CORPUS_DIR = "./extracted_content"  # Directory containing the text files
 
-CHROMA_PATH = "chroma_db_v4"    
+# v4 with halong_embedding
+# v5 with TuanNM171284/TuanNM171284-HaLong-embedding-medical
+CHROMA_PATH = "F://VNPT_Intern//chroma_db_v4"
+
+
+EMBEDDING = HuggingFaceEmbeddings(
+            model_name="TuanNM171284/TuanNM171284-HaLong-embedding-medical",
+            model_kwargs={'device': 'cuda'},  
+            encode_kwargs={'normalize_embeddings': True}
+            )
 
 def load_documents(corpus_dir: str):
         documents = []
@@ -24,12 +33,6 @@ def load_documents(corpus_dir: str):
                 except Exception as e:
                     print(f"Error loading {filename}: {str(e)}")
         return documents
-
-EMBEDDING = HuggingFaceEmbeddings(
-            model_name="hiieu/halong_embedding",
-            model_kwargs={'device': 'cuda'},  
-            encode_kwargs={'normalize_embeddings': True}
-            )
 
 def split_text(documents: list[Document]):
     # Create text splitter with "SEPARATED" as a high-priority separator
@@ -53,75 +56,6 @@ def split_text(documents: list[Document]):
         print(document.metadata)
     
     return chunks
-
-def save_processed_documents(processed_documents, save_path):
-    """
-    Save processed documents to a file.
-    
-    Args:
-        processed_documents: The list of Document objects to save
-        save_path: Path where to save the documents
-    """
-    # Create directory if it doesn't exist
-    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
-    
-    # Determine the file format based on extension
-    _, ext = os.path.splitext(save_path)
-    
-    if ext.lower() == '.pkl':
-        # Save as pickle (binary)
-        with open(save_path, 'wb') as f:
-            pickle.dump(processed_documents, f)
-    elif ext.lower() == '.json':
-        # Save as JSON (text)
-        serializable_docs = []
-        for doc in processed_documents:
-            serializable_docs.append({
-                "page_content": doc.page_content,
-                "metadata": doc.metadata
-            })
-        with open(save_path, 'w', encoding='utf-8') as f:
-            json.dump(serializable_docs, f, ensure_ascii=False, indent=2)
-    else:
-        # Default to pickle
-        with open(save_path, 'wb') as f:
-            pickle.dump(processed_documents, f)
-    
-    print(f"Saved {len(processed_documents)} processed documents to {save_path}")
-
-def load_processed_documents(load_path):
-    """
-    Load processed documents from a file.
-    
-    Args:
-        load_path: Path from where to load the documents
-        
-    Returns:
-        List of Document objects
-    """
-    _, ext = os.path.splitext(load_path)
-    
-    if ext.lower() == '.pkl':
-        # Load from pickle
-        with open(load_path, 'rb') as f:
-            return pickle.load(f)
-    elif ext.lower() == '.json':
-        # Load from JSON
-        with open(load_path, 'r', encoding='utf-8') as f:
-            serialized_docs = json.load(f)
-        
-        # Convert back to Document objects
-        documents = []
-        for doc_dict in serialized_docs:
-            documents.append(Document(
-                page_content=doc_dict["page_content"],
-                metadata=doc_dict["metadata"]
-            ))
-        return documents
-    else:
-        # Default to pickle
-        with open(load_path, 'rb') as f:
-            return pickle.load(f)
 
 def save_to_chroma(chunks: list[Document]):
     # Clear out the database first.

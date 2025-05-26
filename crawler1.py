@@ -42,9 +42,8 @@ def save_to_csv(data, filename='links.csv'):
     
     print(f"Data saved to {filename}")
 
-# Usage example
 if __name__ == "__main__":
-    # Replace with the actual URL of the website you want to crawl
+
     website_url = "https://tamanhhospital.vn/benh-hoc-a-z/"
     class_name = "cl_33"
     

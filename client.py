@@ -1,15 +1,23 @@
-import streamlit as st
+import time
+from sentence_transformers import CrossEncoder
 from streamlit_chat import message
-import torch
-from langchain.prompts import PromptTemplate
+from langchain.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_community.llms import LlamaCpp
 from langchain_community.vectorstores import Chroma
-import os
-import logging
-import json
-from query_data import CHROMA_PATH, PROMPT_TEMPLATE, MODEL_PATH, EMBEDDING, load_processed_documents, get_unique_metadata
-import asyncio
 from datetime import datetime
+from langchain_core.callbacks import CallbackManager, StreamingStdOutCallbackHandler
+import asyncio
+import py_vncorenlp
+import streamlit as st
+import torch
+import os
+
+
+from query_data import MODEL_PATH, EMBEDDING, MODEL_ID, deduplicate_by_embedding, process_text_with_linebreaks
+from db_create import CHROMA_PATH
+from log import setup_logger
+# Set the environment variable for Java
+os.environ["JAVA_HOME"] = "C:/Program Files/Java/jdk-17"  # Set JDK path
 
 try:
     asyncio.get_running_loop()
@@ -18,28 +26,8 @@ except RuntimeError:
 
 torch.classes.__path__ = [] 
 
-# Set up logging to JSON file
-LOG_FILE = "query_document_response_logs.json"
 
-def setup_logger():
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    
-    # Create a custom formatter that produces well-formatted JSON
-    class JsonFormatter(logging.Formatter):
-        def format(self, record):
-            if isinstance(record.msg, dict):
-                return json.dumps(record.msg, ensure_ascii=False, indent=2)
-            return json.dumps({"message": record.getMessage()}, ensure_ascii=False, indent=2)
-    
-    handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
-    handler.setFormatter(JsonFormatter())
-    logger.addHandler(handler)
-    return logger
-
-logger = setup_logger()
-
-def log_interaction(query, documents, response, prompt=None, filtered_docs=None, threshold=None):
+def log_interaction(query, documents, response, prompt=None):
     """
     Log the complete interaction: query, documents, prompt, and response
     
@@ -49,27 +37,14 @@ def log_interaction(query, documents, response, prompt=None, filtered_docs=None,
         response (str): The system's response to the query
         prompt (str, optional): The prompt sent to the LLM
         filtered_docs (list, optional): Documents that passed the threshold
-        threshold (float, optional): The similarity threshold used
     """
     # Create a simplified view of the documents for logging
     docs_for_log = []
-    for doc, score in documents:
+    for doc in documents:
         docs_for_log.append({
             "content": doc.page_content,
             "metadata": doc.metadata,
-            "score": float(score)  # Convert to float for JSON serialization
         })
-    
-    # Create filtered docs log if provided
-    filtered_docs_log = None
-    if filtered_docs:
-        filtered_docs_log = []
-        for doc, score in filtered_docs:
-            filtered_docs_log.append({
-                "content": doc.page_content,
-                "metadata": doc.metadata,
-                "score": float(score)
-            })
     
     # Create the log entry
     log_entry = {
@@ -84,27 +59,13 @@ def log_interaction(query, documents, response, prompt=None, filtered_docs=None,
     if prompt is not None:
         log_entry["prompt"] = prompt
     
-    # Add filtering information if available
-    if threshold is not None:
-        log_entry["threshold"] = threshold
-    if filtered_docs_log is not None:
-        log_entry["filtered_documents"] = filtered_docs_log
-    
     # Log the entry
     logger.info(log_entry)
 
-def document_to_dict(doc):
-    return {
-        "page_content": doc.page_content,
-        "metadata": doc.metadata
-    }
+logger = setup_logger()
 
-db_path = "./chroma_db_v3"
-# Define similarity score threshold
-SIMILARITY_THRESHOLD = 0.7
-
-st.set_page_config(page_title="AI Chatbot", layout="wide")
-st.title("AI Medical Chatbot")
+st.set_page_config(page_title="Medical Chatbot", layout="wide")
+st.title("Medical Chatbot")
 
 # Initialize session state
 if "messages" not in st.session_state:
@@ -113,10 +74,12 @@ if "db" not in st.session_state:
     st.session_state["db"] = None
 if "llm" not in st.session_state:
     st.session_state["llm"] = None
-if "processed_documents" not in st.session_state:
-    st.session_state["processed_documents"] = None
 if "session_id" not in st.session_state:
     st.session_state["session_id"] = datetime.now().strftime("%Y%m%d%H%M%S")
+if "rdrsegmenter" not in st.session_state:
+    st.session_state["rdrsegmenter"] = None
+if "chat_mode" not in st.session_state:
+    st.session_state["chat_mode"] = "RAG System"
 
 # Log system initialization
 logger.info({
@@ -125,30 +88,36 @@ logger.info({
     "session_id": st.session_state["session_id"]
 })
 
-# Display chat history
-for i, msg in enumerate(st.session_state["messages"]):
-    message(msg["content"], is_user=msg["is_user"], key=str(i))
+if st.session_state["rdrsegmenter"] is None:
+    st.session_state["rdrsegmenter"] = py_vncorenlp.VnCoreNLP(
+        annotators=["wseg"], 
+        save_dir='F:/VNPT_Intern/.venv/Lib/site-packages/py_vncorenlp'
+    )
+
+with st.sidebar:
+    st.title("Chat Settings")
+    
+    # Mode selection
+    st.session_state["chat_mode"] = st.radio(
+        "Select Chat Mode",
+        ["Normal Chat", "RAG System"],
+        help="Normal Chat: Direct conversation with LLM \n\n RAG System: Answers based on medical knowledge base"
+    )
 
 # Initialize vector database
 if st.session_state["db"] is None:
     try:
-        if not os.path.exists(db_path):
-            st.error(f"⚠️ Database path does not exist: {db_path}")
+        if not os.path.exists(CHROMA_PATH):
+            st.error(f"⚠️ Database path does not exist: {CHROMA_PATH}")
             logger.error({
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "error": f"Database path does not exist: {db_path}",
+                "error": f"Database path does not exist: {CHROMA_PATH}",
                 "session_id": st.session_state["session_id"]
             })
         else:
-            st.session_state["db"] = Chroma(persist_directory=CHROMA_PATH, embedding_function=EMBEDDING)
-            st.session_state["processed_documents"] = load_processed_documents('./data/processed_documents.pkl')
-            
-            logger.info({
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "event": "database_loaded",
-                "documents_count": len(st.session_state["processed_documents"]),
-                "session_id": st.session_state["session_id"]
-            })
+            st.session_state["db"] = Chroma(
+                                            persist_directory=CHROMA_PATH, 
+                                            embedding_function=EMBEDDING)
             
             if not os.path.exists(MODEL_PATH):
                 st.error(f"⚠️ Model file not found: {MODEL_PATH}")
@@ -159,24 +128,15 @@ if st.session_state["db"] is None:
                 })
             else:
                 try:
+                    callback_manager = CallbackManager([StreamingStdOutCallbackHandler()])
                     st.session_state["llm"] = LlamaCpp(
                         model_path=MODEL_PATH,
                         n_gpu_layers=20,
                         n_batch=512,
-                        max_tokens=256,
                         n_ctx=2000,
-                        f16_kv=True,
-                        temperature=0.5,
-                        repeat_penalty=1.1,
-                        echo=False,  
-                        stop=["\nUser:", "\n###", "\nQ:"]  
+                        callback_manager=callback_manager,
+                        verbose=True,
                     )
-                    logger.info({
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "event": "model_loaded",
-                        "model_path": MODEL_PATH,
-                        "session_id": st.session_state["session_id"]
-                    })
                     st.success("Hệ thống đã sẵn sàng! Hãy nhập câu hỏi của bạn.")
                 except Exception as e:
                     st.error(f"⚠️ {str(e)}")
@@ -192,13 +152,16 @@ if st.session_state["db"] is None:
             "error": f"Initialization error: {str(e)}",
             "session_id": st.session_state["session_id"]
         })
-
+for msg in st.session_state["messages"]:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 # User input
-user_input = st.chat_input("Nhập câu hỏi của bạn:")
+user_input = st.chat_input("Nhập câu hỏi của bạn tại đây...")
 if user_input:
     try:
-        st.session_state["messages"].append({"content": user_input, "is_user": True})
-        message(user_input, is_user=True)
+        st.session_state["messages"].append({"content": user_input, "role": "user"})
+        with st.chat_message("user"):
+            st.markdown(user_input)
 
         llm = st.session_state["llm"]
         db = st.session_state["db"]
@@ -212,63 +175,91 @@ if user_input:
                 "session_id": st.session_state["session_id"]
             })
         else:
-            with st.spinner("Đang xử lý câu hỏi của bạn..."):
-                try:
-                    # Get documents from database
-                    response = db.similarity_search_with_relevance_scores(query_text, k=5)
-                    
-                    # Filter documents based on similarity threshold
-                    filtered_response = [(doc, score) for doc, score in response if score > SIMILARITY_THRESHOLD]
-                    
-                    if not filtered_response:
-                        formatted_response = "Không tìm thấy kết quả phù hợp. Vui lòng thử lại với câu hỏi khác."
-                        
-                        # Log the interaction with no filtered documents
-                        log_interaction(
-                            query=query_text,
-                            documents=response,
-                            response=formatted_response,
-                            filtered_docs=[],
-                            threshold=SIMILARITY_THRESHOLD
-                        )
-                    else:
-                        # Get metadata only from documents that passed the threshold
-                        metadata = get_unique_metadata(filtered_response)
-                        filtered_documents = [
-                            doc for doc in st.session_state["processed_documents"] 
-                            if (doc.metadata.get('original_document_id'), doc.metadata.get('part')) in metadata
-                        ]
-                        
-                        # Create context from filtered documents
-                        context_text = "\n---\n".join(doc.page_content.lower().replace('\n', '. ').strip() for doc in filtered_documents)
-                        prompt_template = PromptTemplate.from_template(PROMPT_TEMPLATE)
-                        prompt = prompt_template.format(context=context_text, question=query_text)
-                        
-                        # Generate response
-                        response_text = llm.invoke(prompt)
-                        formatted_response = f"{response_text}"
-                        
-                        # Log the complete interaction including the prompt
-                        log_interaction(
-                            query=query_text,
-                            documents=response,
-                            response=formatted_response,
-                            prompt=prompt,  # Include the full prompt
-                            filtered_docs=filtered_response,
-                            threshold=SIMILARITY_THRESHOLD
-                        )
+            
+            if st.session_state["chat_mode"] == "Normal Chat":
+                # Direct LLM interaction without RAG
+                template = """Answer the question directly without using any context or documents.
+                                Question: {question}
+                                Answer:"""
+                prompt = PromptTemplate.from_template(template)
+                llm_chain = prompt | llm
 
-                    st.session_state["messages"].append({"content": formatted_response, "is_user": False})
-                    message(formatted_response, is_user=False)
-                except Exception as e:
-                    st.error(f"⚠️ {str(e)}")
-                    # Log error
-                    logger.error({
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "error": str(e),
-                        "query": query_text,
-                        "session_id": st.session_state.get("session_id", "unknown")
-                    })
+                response_text = llm_chain.invoke({"question": query_text})                  
+                # Log the complete interaction including the prompt
+                log_interaction(
+                    query=query_text,
+                    documents=[],
+                    response=response_text,
+                    prompt=prompt
+                )
+            else:    
+                
+                    # Get documents from database
+                    
+                    response = db.similarity_search(query_text, k=8)
+                    if not response:
+                        st.error("Không tìm thấy tài liệu nào phù hợp.")
+                        logger.warning({
+                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "warning": "No documents found",
+                            "query": query_text,
+                            "session_id": st.session_state["session_id"]
+                        })
+                    rdrsegmenter = st.session_state["rdrsegmenter"]
+                    
+                    # Prepare for reranking with PhoRanker
+                    tokenized_query = " ".join(rdrsegmenter.word_segment(query_text))
+    
+                    # Create pairs for reranking
+                    documents = [doc.page_content for doc in response]
+                    tokenized_documents = [" ".join(rdrsegmenter.word_segment(doc)) for doc in documents]    
+                    tokenized_pairs = [[tokenized_query, doc] for doc in tokenized_documents]
+
+                    rerank = CrossEncoder(MODEL_ID)
+
+                    # Get reranking scores
+                    scores = rerank.predict(tokenized_pairs)
+                    
+                    # Create reranked results with scores
+                    reranked_results = list(zip(response, scores))
+                    
+                    # Sort by score (descending)
+                    reranked_results = sorted(reranked_results, key=lambda x: x[1], reverse=True)[:3]
+                        
+                    # Create context from top documents with deduplication
+                    deduped_results = deduplicate_by_embedding(reranked_results, similarity_threshold=0.5)
+
+                    context_text = "\n\n---\n\n".join(
+                                                d.page_content.lower().replace('\n', ' ').strip()
+                                                for d, _ in deduped_results
+                                            )
+
+                    # Enhanced prompt template for Vietnamese responses without repetition
+                    prompt_template = ChatPromptTemplate([
+                                    ("system", "You are a helpful Vietnamese medical assistant. Answer the questions in Vietnamese and use the information provided."),                                        
+                                    ("user", "Context: {context}\n\n Question: {question}") ])
+                    prompt = prompt_template.format(context=context_text, question=query_text)
+                        
+                    # Generate response
+                    response_text = llm.invoke(prompt)
+                    # Log the complete interaction including the prompt
+                    log_interaction(
+                            query=query_text,
+                            documents=response,
+                            response=response_text,
+                            prompt=prompt,
+                        )
+            st.session_state["messages"].append({"content": response_text, "role": "assistant"})
+            with st.chat_message("assistant"):
+                message_placeholder = st.empty()
+                full_response = ""
+
+                for partial_response in process_text_with_linebreaks(response_text):
+                    full_response = partial_response  
+                    message_placeholder.markdown(full_response + "▍")  
+                    time.sleep(0.05)
+
+                message_placeholder.markdown(full_response)  # dòng cuối cùng bỏ dấu typing
     except Exception as e:
         st.error(f"⚠️ {str(e)}")
         logger.error({
@@ -277,3 +268,6 @@ if user_input:
             "query": query_text if 'query_text' in locals() else "unknown",
             "session_id": st.session_state.get("session_id", "unknown")
         })
+
+
+
